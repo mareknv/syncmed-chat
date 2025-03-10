@@ -14,6 +14,7 @@ import { nord } from 'react-syntax-highlighter/dist/esm/styles/prism'
 import styles from './Chat.module.css'
 import Contoso from '../../assets/pill.svg'
 import { XSSAllowTags } from '../../constants/sanatizeAllowables'
+import { UserInfoForm } from '../../components/UserInfoForm'
 
 import {
   ChatMessage,
@@ -45,6 +46,12 @@ const enum messageStatus {
   Done = 'Done'
 }
 
+interface UserInfo {
+  name: string;
+  age: string;
+  gender: string;
+}
+
 const Chat = () => {
   const appStateContext = useContext(AppStateContext)
   const ui = appStateContext?.state.frontendSettings?.ui
@@ -65,6 +72,7 @@ const Chat = () => {
   const [errorMsg, setErrorMsg] = useState<ErrorMessage | null>()
   const [logo, setLogo] = useState('')
   const [answerId, setAnswerId] = useState<string>('')
+  const [userInfo, setUserInfo] = useState<UserInfo | null>(null)
 
   const errorDialogContentProps = {
     type: DialogType.close,
@@ -195,33 +203,48 @@ const Chat = () => {
       date: new Date().toISOString()
     }
 
-    let conversation: Conversation | null | undefined
+    let conversation: Conversation;
     if (!conversationId) {
+      // Create a new conversation
       conversation = {
-        id: conversationId ?? uuid(),
-        title: question as string,
+        id: uuid(),
+        title: typeof question === 'string' ? question : 'New conversation',
         messages: [userMessage],
         date: new Date().toISOString()
-      }
+      };
     } else {
-      conversation = appStateContext?.state?.currentChat
-      if (!conversation) {
-        console.error('Conversation not found.')
-        setIsLoading(false)
-        setShowLoadingMessage(false)
-        abortFuncs.current = abortFuncs.current.filter(a => a !== abortController)
-        return
-      } else {
-        conversation.messages.push(userMessage)
+      // Get existing conversation
+      const existingConversation = appStateContext?.state?.currentChat;
+      if (!existingConversation) {
+        console.error('Conversation not found.');
+        setIsLoading(false);
+        setShowLoadingMessage(false);
+        abortFuncs.current = abortFuncs.current.filter(a => a !== abortController);
+        return;
       }
+      
+      // Make a deep copy of the conversation to ensure we don't lose message content
+      conversation = JSON.parse(JSON.stringify(existingConversation));
+      
+      // Log current messages for debugging
+      console.log("Current conversation messages before adding user message:", conversation.messages);
+      
+      // Add the new user message
+      conversation.messages.push(userMessage);
     }
 
-    appStateContext?.dispatch({ type: 'UPDATE_CURRENT_CHAT', payload: conversation })
-    setMessages(conversation.messages)
+    // Update app state with the new/updated conversation
+    appStateContext?.dispatch({ type: 'UPDATE_CURRENT_CHAT', payload: conversation });
+    setMessages(conversation.messages);
 
+    // Create the request with the complete conversation history
     const request: ConversationRequest = {
-      messages: [...conversation.messages.filter(answer => answer.role !== ERROR)]
-    }
+      messages: [...conversation.messages.filter(answer => answer.role !== ERROR)],
+      userProfile: userInfo || undefined
+    };
+    
+    // Log what we're sending to the API
+    console.log("Sending messages to API:", request.messages);
 
     let result = {} as ChatResponse
     try {
@@ -268,9 +291,11 @@ const Chat = () => {
             }
           })
         }
-        conversation.messages.push(toolMessage, assistantMessage)
-        appStateContext?.dispatch({ type: 'UPDATE_CURRENT_CHAT', payload: conversation })
-        setMessages([...messages, toolMessage, assistantMessage])
+        if (conversation) {
+          conversation.messages.push(toolMessage, assistantMessage);
+          appStateContext?.dispatch({ type: 'UPDATE_CURRENT_CHAT', payload: conversation });
+          setMessages([...messages, toolMessage, assistantMessage]);
+        }
       }
     } catch (e) {
       if (!abortController.signal.aborted) {
@@ -290,9 +315,11 @@ const Chat = () => {
           content: errorMessage,
           date: new Date().toISOString()
         }
-        conversation.messages.push(errorChatMsg)
-        appStateContext?.dispatch({ type: 'UPDATE_CURRENT_CHAT', payload: conversation })
-        setMessages([...messages, errorChatMsg])
+        if (conversation) {
+          conversation.messages.push(errorChatMsg);
+          appStateContext?.dispatch({ type: 'UPDATE_CURRENT_CHAT', payload: conversation });
+          setMessages([...messages, errorChatMsg]);
+        }
       } else {
         setMessages([...messages, userMessage])
       }
@@ -757,6 +784,139 @@ const Chat = () => {
     )
   }
 
+  const handleUserInfoSubmit = async (info: UserInfo) => {
+    setUserInfo(info);
+    setIsLoading(true);
+    setShowLoadingMessage(true);
+    
+    // Create hidden user message to trigger the initial conversation
+    const systemInitiatedMessage: ChatMessage = {
+      id: uuid(),
+      role: 'user',
+      content: 'Start the conversation',
+      date: new Date().toISOString()
+    };
+    
+    // Make the initial API request with the user profile
+    const request: ConversationRequest = {
+      messages: [systemInitiatedMessage],
+      userProfile: info
+    };
+    
+    const abortController = new AbortController();
+    try {
+      abortFuncs.current.unshift(abortController);
+      
+      const response = await conversationApi(request, abortController.signal);
+      
+      // Process the response and update the messages
+      if (response?.body) {
+        const reader = response.body.getReader();
+        
+        let runningText = '';
+        let assistantMessage = {} as ChatMessage;
+        let assistantContent = '';
+        let toolMessage = {} as ChatMessage;
+        
+        while (true) {
+          setProcessMessages(messageStatus.Processing);
+          const { done, value } = await reader.read();
+          if (done) break;
+          
+          var text = new TextDecoder('utf-8').decode(value);
+          const objects = text.split('\n');
+          
+          objects.forEach(obj => {
+            try {
+              if (obj !== '' && obj !== '{}') {
+                runningText += obj;
+                const result = JSON.parse(runningText);
+                
+                if (result.choices?.length > 0) {
+                  result.choices[0].messages.forEach((resultObj: ChatMessage) => {
+                    resultObj.id = result.id;
+                    resultObj.date = new Date().toISOString();
+                    
+                    if (resultObj.role === ASSISTANT) {
+                      setAnswerId(resultObj.id);
+                      assistantContent += resultObj.content;
+                      assistantMessage = { ...assistantMessage, ...resultObj };
+                      assistantMessage.content = assistantContent;
+                      
+                      if (resultObj.context) {
+                        toolMessage = {
+                          id: uuid(),
+                          role: TOOL,
+                          content: resultObj.context,
+                          date: new Date().toISOString()
+                        };
+                      }
+                      
+                      // Show message as it's being streamed
+                      setShowLoadingMessage(false);
+                      
+                      // Update the visible messages - only show assistant's message
+                      setMessages([assistantMessage]);
+                    }
+                    
+                    if (resultObj.role === TOOL) {
+                      toolMessage = resultObj;
+                    }
+                  });
+                }
+                runningText = '';
+              }
+            } catch (e) {
+              if (!(e instanceof SyntaxError)) {
+                console.error(e);
+              } else {
+                console.log('Incomplete message. Continuing...');
+              }
+            }
+          });
+        }
+        
+        // When stream is finished, create the final conversation with complete message
+        if (assistantContent) {
+          // Save both messages to the conversation history
+          const conversationId = uuid();
+          const updatedConversation = {
+            id: conversationId,
+            title: 'New conversation',
+            messages: [systemInitiatedMessage],
+            date: new Date().toISOString()
+          };
+          
+          // Add the appropriate messages based on whether we have tool content
+          if (isEmpty(toolMessage)) {
+            updatedConversation.messages.push(assistantMessage);
+          } else {
+            updatedConversation.messages.push(toolMessage, assistantMessage);
+          }
+          
+          console.log("Saving conversation with messages:", updatedConversation.messages);
+          
+          // Update the app state with the complete conversation
+          appStateContext?.dispatch({ type: 'UPDATE_CURRENT_CHAT', payload: updatedConversation });
+          
+          // Only show the assistant message in the UI (or tool + assistant if tool exists)
+          if (isEmpty(toolMessage)) {
+            setMessages([assistantMessage]);
+          } else {
+            setMessages([toolMessage, assistantMessage]);
+          }
+        }
+      }
+    } catch (e) {
+      console.error('Error initiating conversation:', e);
+    } finally {
+      setIsLoading(false);
+      setShowLoadingMessage(false);
+      setProcessMessages(messageStatus.Done);
+      abortFuncs.current = abortFuncs.current.filter(a => a !== abortController);
+    }
+  };
+
   return (
     <div className={styles.container} role="main">
       {showAuthMessage ? (
@@ -789,7 +949,9 @@ const Chat = () => {
       ) : (
         <Stack horizontal className={styles.chatRoot}>
           <div className={styles.chatContainer}>
-            {!messages || messages.length < 1 ? (
+            {!userInfo ? (
+              <UserInfoForm onSubmit={handleUserInfoSubmit} />
+            ) : !messages || messages.length < 1 ? (
               <Stack className={styles.chatEmptyState}>
                 <img src={logo} className={styles.chatIcon} aria-hidden="true" />
                 <h1 className={styles.chatEmptyStateTitle}>{ui?.chat_title}</h1>
@@ -799,7 +961,7 @@ const Chat = () => {
               <div className={styles.chatMessageStream} style={{ marginBottom: isLoading ? '40px' : '0px' }} role="log">
                 {messages.map((answer, index) => (
                   <>
-                    {answer.role === 'user' ? (
+                    {answer.role === 'user' && answer.content !== 'Start the conversation' ? (
                       <div className={styles.chatMessageUser} tabIndex={0}>
                         <div className={styles.chatMessageUserMessage}>
                           {typeof answer.content === "string" && answer.content ? answer.content : Array.isArray(answer.content) ? <>{answer.content[0].text} <img className={styles.uploadedImageChat} src={answer.content[1].image_url.url} alt="Uploaded Preview" /></> : null}

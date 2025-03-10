@@ -208,12 +208,25 @@ async def init_cosmosdb_client():
 
 def prepare_model_args(request_body, request_headers):
     request_messages = request_body.get("messages", [])
+    user_profile = request_body.get("userProfile", None)
+    
     messages = []
     if not app_settings.datasource:
+        system_message = app_settings.azure_openai.system_message
+        
+        # Add user profile info to system message if available
+        if user_profile:
+            profile_info = f"The user's name is {user_profile['name']}, age {user_profile['age']}, gender {user_profile['gender']}. "
+            # If the first message is the initial "Start the conversation" message, replace it with a greeting
+            if request_messages and len(request_messages) == 1 and request_messages[0].get('content') == 'Start the conversation':
+                system_message = profile_info + system_message + " Start the conversation with a personalized greeting to the user based on their profile information, without mentioning that this information was provided in a form."
+            else:
+                system_message = profile_info + system_message
+            
         messages = [
             {
                 "role": "system",
-                "content": app_settings.azure_openai.system_message
+                "content": system_message
             }
         ]
 
@@ -344,7 +357,7 @@ async def send_chat_request(request_body, request_headers):
             
     request_body['messages'] = filtered_messages
     model_args = prepare_model_args(request_body, request_headers)
-
+    # breakpoint()
     try:
         azure_openai_client = await init_openai_client()
         raw_response = await azure_openai_client.chat.completions.with_raw_response.create(**model_args)
@@ -353,7 +366,7 @@ async def send_chat_request(request_body, request_headers):
     except Exception as e:
         logging.exception("Exception in send_chat_request")
         raise e
-
+    # breakpoint()
     return response, apim_request_id
 
 

@@ -84,8 +84,15 @@ export type ChatResponse = {
   error?: any
 }
 
+export type UserProfile = {
+  name: string;
+  age: string;
+  gender: string;
+}
+
 export type ConversationRequest = {
-  messages: ChatMessage[]
+  messages: ChatMessage[];
+  userProfile?: UserProfile;
 }
 
 export type UserInfo = {
